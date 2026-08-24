@@ -503,6 +503,77 @@ class TestUserTokenMiddleware:
         assert passed_scope["state"]["user_atlassian_auth_type"] == "oauth"
 
     @pytest.mark.anyio
+    async def test_duplicated_bearer_header_is_collapsed(
+        self, middleware, mock_scope, mock_receive, mock_send
+    ):
+        """A doubled Authorization header yields the single credential.
+
+        Regression: some gateways/clients send Authorization twice, which RFC
+        9110 folds into "Bearer <tok>, Bearer <tok>". Stripping only the first
+        "Bearer " left "<tok>, Bearer <tok>", which Jira/Confluence reject with
+        401 "Client must be authenticated to access this resource".
+        """
+        token = "eyJhbGciOiJIUzI1NiJ9.eyJpZCI6ImFiYyJ9.c2lnbmF0dXJl"
+        mock_scope["headers"] = [
+            (b"authorization", f"Bearer {token}, Bearer {token}".encode())
+        ]
+
+        await middleware(mock_scope, mock_receive, mock_send)
+
+        middleware.app.assert_called_once()
+        mock_send.assert_not_called()
+
+        passed_scope = middleware.app.call_args[0][0]
+        assert passed_scope["state"]["user_atlassian_token"] == token
+        assert passed_scope["state"]["user_atlassian_auth_type"] == "oauth"
+
+    @pytest.mark.anyio
+    async def test_duplicated_pat_header_is_collapsed(
+        self, middleware, mock_scope, mock_receive, mock_send
+    ):
+        """The same folding fix applies to a repeated Token (PAT) header."""
+        mock_scope["headers"] = [
+            (b"authorization", b"Token my-pat-token, Token my-pat-token")
+        ]
+
+        await middleware(mock_scope, mock_receive, mock_send)
+
+        middleware.app.assert_called_once()
+        passed_scope = middleware.app.call_args[0][0]
+        assert passed_scope["state"]["user_atlassian_token"] == "my-pat-token"
+        assert passed_scope["state"]["user_atlassian_auth_type"] == "pat"
+
+    @pytest.mark.anyio
+    async def test_conflicting_repeated_auth_headers_rejected(
+        self, middleware, mock_scope, mock_receive, mock_send
+    ):
+        """Differing repeated credentials are refused, not silently guessed."""
+        mock_scope["headers"] = [
+            (b"authorization", b"Bearer token-one, Bearer token-two")
+        ]
+
+        await middleware(mock_scope, mock_receive, mock_send)
+
+        # Request rejected before reaching the app.
+        middleware.app.assert_not_called()
+        assert mock_send.called
+        status_message = mock_send.call_args_list[0][0][0]
+        assert status_message["status"] == 401
+
+    @pytest.mark.anyio
+    async def test_single_bearer_token_with_comma_is_untouched(
+        self, middleware, mock_scope, mock_receive, mock_send
+    ):
+        """A lone credential containing a comma must not be split."""
+        mock_scope["headers"] = [(b"authorization", b"Bearer abc,def")]
+
+        await middleware(mock_scope, mock_receive, mock_send)
+
+        middleware.app.assert_called_once()
+        passed_scope = middleware.app.call_args[0][0]
+        assert passed_scope["state"]["user_atlassian_token"] == "abc,def"
+
+    @pytest.mark.anyio
     async def test_valid_pat_token_proceeds(
         self, middleware, mock_scope, mock_receive, mock_send
     ):

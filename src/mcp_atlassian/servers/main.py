@@ -6,6 +6,7 @@ import functools
 import json
 import logging
 import os
+import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any, Literal, Optional
@@ -534,6 +535,62 @@ class AtlassianMCP(ErrorPreservingFastMCP[MainAppContext]):
         return app
 
 
+_AUTH_SCHEME_RE = re.compile(r"^(?:Bearer|Token|Basic)\s", re.IGNORECASE)
+
+
+def collapse_repeated_auth_header(auth_header: str) -> tuple[str | None, str | None]:
+    """Collapse an ``Authorization`` header that arrived more than once.
+
+    Some gateways and MCP clients send ``Authorization`` twice (for example when
+    a connector injects the credential and the OAuth layer adds it again). Per
+    RFC 9110 the duplicates are folded into a single comma-separated value::
+
+        Authorization: Bearer <token>, Bearer <token>
+
+    Naively stripping the leading ``Bearer `` then yields
+    ``<token>, Bearer <token>``, which Jira/Confluence reject with
+    ``401 Client must be authenticated to access this resource``.
+
+    Recover the credential when every repeat is identical. If the repeats
+    disagree, refuse rather than silently picking one — guessing which identity
+    the caller meant would be an authorization decision we cannot make safely.
+
+    Args:
+        auth_header: Raw Authorization header value.
+
+    Returns:
+        ``(header, error)``. ``header`` is the collapsed value, or the original
+        when no folding was detected; it is ``None`` when ``error`` is set.
+    """
+    if "," not in auth_header:
+        return auth_header, None
+
+    parts = [part.strip() for part in auth_header.split(",")]
+    parts = [part for part in parts if part]
+
+    # Only treat this as a folded header when every segment looks like a
+    # complete credential. Anything else (e.g. a scheme whose credential
+    # legitimately contains a comma) is passed through untouched.
+    if len(parts) < 2 or not all(_AUTH_SCHEME_RE.match(part) for part in parts):
+        return auth_header, None
+
+    if len(set(parts)) > 1:
+        logger.warning(
+            "UserTokenMiddleware: Authorization header repeated with "
+            "%d differing credentials; refusing the request.",
+            len(set(parts)),
+        )
+        return None, "Unauthorized: Conflicting Authorization credentials"
+
+    logger.warning(
+        "UserTokenMiddleware: Authorization header arrived %d times with an "
+        "identical credential; collapsing to a single value. The client is "
+        "sending a duplicate Authorization header.",
+        len(parts),
+    )
+    return parts[0], None
+
+
 class UserTokenMiddleware:
     """ASGI-compliant middleware to extract Atlassian user tokens/credentials.
 
@@ -772,7 +829,15 @@ class UserTokenMiddleware:
 
             # Process Authorization header
             if auth_header_str:
-                self._parse_auth_header(auth_header_str, scope)
+                collapsed_auth, dedupe_error = collapse_repeated_auth_header(
+                    auth_header_str
+                )
+                if dedupe_error or collapsed_auth is None:
+                    scope["state"]["auth_validation_error"] = (
+                        dedupe_error or "Unauthorized: Invalid Authorization header"
+                    )
+                    return
+                self._parse_auth_header(collapsed_auth, scope)
             else:
                 logger.debug("UserTokenMiddleware: No Authorization header provided")
                 # If service headers are present without Authorization header, set PAT auth type
