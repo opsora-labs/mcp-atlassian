@@ -34,7 +34,14 @@ class TestConfluenceV2Adapter:
             "status": "current",
             "title": "Test Page",
             "spaceId": "789",
-            "version": {"number": 5},
+            "authorId": "creator-account-id",
+            "createdAt": "2024-01-01T09:00:00.000Z",
+            "version": {
+                "number": 5,
+                "createdAt": "2024-01-02T10:00:00.000Z",
+                "authorId": "updater-account-id",
+                "message": "Updated page content",
+            },
             "body": {
                 "storage": {"value": "<p>Test content</p>", "representation": "storage"}
             },
@@ -65,6 +72,11 @@ class TestConfluenceV2Adapter:
         assert result["space"]["key"] == "TEST"
         assert result["space"]["id"] == "789"
         assert result["version"]["number"] == 5
+        assert result["version"]["when"] == "2024-01-02T10:00:00.000Z"
+        assert result["version"]["by"]["accountId"] == "updater-account-id"
+        assert result["history"]["createdDate"] == "2024-01-01T09:00:00.000Z"
+        assert result["history"]["createdBy"]["accountId"] == "creator-account-id"
+        assert result["history"]["lastUpdated"]["when"] == "2024-01-02T10:00:00.000Z"
         assert result["body"]["storage"]["value"] == "<p>Test content</p>"
         assert result["body"]["storage"]["representation"] == "storage"
 
@@ -112,6 +124,47 @@ class TestConfluenceV2Adapter:
         with pytest.raises(ValueError, match="Failed to get page '123456'"):
             v2_adapter.get_page("123456")
 
+    def test_create_page_with_live_subtype(self, v2_adapter, mock_session):
+        """Test creating a Live Doc page passes subtype to the v2 API."""
+        space_response = Mock()
+        space_response.json.return_value = {"results": [{"id": "space-123"}]}
+        create_response = Mock()
+        create_response.json.return_value = {
+            "id": "page-123",
+            "status": "current",
+            "title": "Live Agenda",
+            "spaceId": "space-123",
+            "subtype": "live",
+            "version": {"number": 1},
+        }
+        mock_session.get.return_value = space_response
+        mock_session.post.return_value = create_response
+
+        result = v2_adapter.create_page(
+            space_key="TEAM",
+            title="Live Agenda",
+            body="<p>Agenda</p>",
+            parent_id="parent-123",
+            subtype="live",
+        )
+
+        mock_session.post.assert_called_once_with(
+            "https://example.atlassian.net/wiki/api/v2/pages",
+            json={
+                "spaceId": "space-123",
+                "status": "current",
+                "title": "Live Agenda",
+                "body": {
+                    "representation": "storage",
+                    "value": "<p>Agenda</p>",
+                },
+                "parentId": "parent-123",
+                "subtype": "live",
+            },
+        )
+        assert result["id"] == "page-123"
+        assert result["subtype"] == "live"
+
     def test_get_page_with_expand_parameter(self, v2_adapter, mock_session):
         """Test that expand parameter is accepted but not used."""
         # Mock the v2 API response
@@ -135,6 +188,122 @@ class TestConfluenceV2Adapter:
 
         # Verify we still get a result
         assert result["id"] == "123456"
+
+    def test_get_page_direct_children_resolves_space_key(
+        self, v2_adapter, mock_session
+    ):
+        """Test v2 direct children are normalized with space metadata."""
+        children_response = Mock()
+        children_response.status_code = 200
+        children_response.json.return_value = {
+            "results": [
+                {
+                    "id": "123456",
+                    "status": "current",
+                    "title": "Child Page",
+                    "type": "page",
+                    "spaceId": "789",
+                }
+            ]
+        }
+
+        space_response = Mock()
+        space_response.status_code = 200
+        space_response.json.return_value = {"key": "TEST", "name": "Test Space"}
+
+        mock_session.get.side_effect = [children_response, space_response]
+
+        result = v2_adapter.get_page_direct_children("999")
+
+        assert result["results"][0]["space"] == {
+            "id": "789",
+            "key": "TEST",
+            "name": "Test Space",
+        }
+        assert mock_session.get.call_count == 2
+
+    def test_get_page_direct_children_handles_repeated_space_ids(
+        self, v2_adapter, mock_session
+    ):
+        """Test v2 direct children resolve each space ID once."""
+        children_response = Mock()
+        children_response.status_code = 200
+        children_response.json.return_value = {
+            "results": [
+                {"id": "1", "title": "A", "type": "page", "spaceId": "789"},
+                {"id": "2", "title": "B", "type": "folder", "spaceId": "789"},
+            ]
+        }
+
+        space_response = Mock()
+        space_response.status_code = 200
+        space_response.json.return_value = {"key": "TEST", "name": "Test Space"}
+
+        mock_session.get.side_effect = [children_response, space_response]
+
+        result = v2_adapter.get_page_direct_children("999")
+
+        assert result["results"][0]["space"]["key"] == "TEST"
+        assert result["results"][1]["space"]["key"] == "TEST"
+        assert result["results"][0]["space"]["name"] == "Test Space"
+        assert mock_session.get.call_count == 2
+
+    def test_get_page_direct_children_handles_numeric_space_id(
+        self, v2_adapter, mock_session
+    ):
+        """Test numeric space IDs are normalized before lookup."""
+        children_response = Mock()
+        children_response.status_code = 200
+        children_response.json.return_value = {
+            "results": [
+                {
+                    "id": "123456",
+                    "status": "current",
+                    "title": "Child Page",
+                    "type": "page",
+                    "spaceId": 789,
+                }
+            ]
+        }
+
+        space_response = Mock()
+        space_response.status_code = 200
+        space_response.json.return_value = {"key": "TEST", "name": "Test Space"}
+
+        mock_session.get.side_effect = [children_response, space_response]
+
+        result = v2_adapter.get_page_direct_children("999")
+
+        assert result["results"][0]["space"] == {
+            "id": "789",
+            "key": "TEST",
+            "name": "Test Space",
+        }
+        assert mock_session.get.call_args_list[1][0][0].endswith("/api/v2/spaces/789")
+
+    def test_get_page_direct_children_preserves_next_link_header(
+        self, v2_adapter, mock_session
+    ):
+        """Test v2 pagination can use the response Link header."""
+        children_response = Mock()
+        children_response.status_code = 200
+        children_response.links = {
+            "next": {
+                "url": (
+                    "https://example.atlassian.net/wiki/api/v2/pages/999/"
+                    "direct-children?cursor=next-token"
+                )
+            }
+        }
+        children_response.json.return_value = {
+            "results": [{"id": "123456", "status": "current", "title": "Child Page"}]
+        }
+
+        mock_session.get.return_value = children_response
+
+        result = v2_adapter.get_page_direct_children("999")
+
+        assert result["_links"]["next"].endswith("cursor=next-token")
 
     @pytest.mark.parametrize(
         "method,call_kwargs,expected_path",
@@ -253,6 +422,74 @@ class TestConfluenceV2AdapterComments:
         assert result["id"] == "222333444"
         assert result["body"]["view"]["value"] == "<p>Reply content</p>"
         assert result["extensions"]["location"] == "footer"
+        mock_session.get.assert_not_called()
+
+    def test_create_footer_comment_refreshes_missing_body(
+        self, v2_adapter, mock_session
+    ):
+        """A create response without body content is refreshed once."""
+        create_response = Mock()
+        create_response.json.return_value = {
+            "id": "222333444",
+            "status": "current",
+            "title": "Re: Comment",
+            "parentCommentId": "456789123",
+            "version": {"number": 1},
+            "_links": {},
+        }
+        refresh_response = Mock()
+        refresh_response.json.return_value = {
+            "id": "222333444",
+            "status": "current",
+            "title": "Re: Comment",
+            "parentCommentId": "456789123",
+            "body": {
+                "storage": {
+                    "value": "<p>Refreshed reply</p>",
+                    "representation": "storage",
+                },
+            },
+            "version": {"number": 1},
+            "_links": {},
+        }
+        mock_session.post.return_value = create_response
+        mock_session.get.return_value = refresh_response
+
+        result = v2_adapter.create_footer_comment(
+            parent_comment_id="456789123",
+            body="<p>Reply content</p>",
+        )
+
+        mock_session.get.assert_called_once_with(
+            "https://example.atlassian.net/wiki/api/v2/footer-comments/222333444",
+            params={"body-format": "storage"},
+        )
+        assert result["body"]["view"]["value"] == "<p>Refreshed reply</p>"
+
+    def test_create_footer_comment_keeps_create_response_when_refresh_fails(
+        self, v2_adapter, mock_session
+    ):
+        """A refresh failure doesn't discard a successful create response."""
+        create_response = Mock()
+        create_response.json.return_value = {
+            "id": "222333444",
+            "status": "current",
+            "title": "Re: Comment",
+            "parentCommentId": "456789123",
+            "version": {"number": 1},
+            "_links": {},
+        }
+        mock_session.post.return_value = create_response
+        mock_session.get.side_effect = requests.RequestException("refresh failed")
+
+        result = v2_adapter.create_footer_comment(
+            parent_comment_id="456789123",
+            body="<p>Reply content</p>",
+        )
+
+        assert result["id"] == "222333444"
+        assert result["body"]["view"]["value"] == ""
+        mock_session.get.assert_called_once()
 
     def test_create_footer_comment_top_level(self, v2_adapter, mock_session):
         """Create top-level comment with pageId sends correct payload."""
